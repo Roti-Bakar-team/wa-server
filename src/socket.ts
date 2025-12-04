@@ -15,6 +15,8 @@ import { API_URL_ChatatID } from "./config";
 
 let sock: WASocket;
 let qrCode: string | null = null;
+let connectionTimestamp: number | null = null;
+const processedMessages = new Set<string>();
 const sessionDir = path.resolve(SESSION_DIR);
 
 // Function to delete the session directory
@@ -44,6 +46,8 @@ export async function connectToWhatsApp(): Promise<void> {
       qrCode = qr;
     }
     if (connection === "close") {
+      connectionTimestamp = null; // Reset timestamp on close
+      processedMessages.clear(); // Clear processed messages on disconnect
       const shouldReconnect =
         (lastDisconnect?.error as Boom)?.output?.statusCode !==
         DisconnectReason.loggedOut;
@@ -63,6 +67,7 @@ export async function connectToWhatsApp(): Promise<void> {
       }
     } else if (connection === "open") {
       console.log("Connection opened");
+      connectionTimestamp = Math.floor(Date.now() / 1000); // Set timestamp on open
       qrCode = null; // Clear QR code after successful login
     }
   });
@@ -72,30 +77,46 @@ export async function connectToWhatsApp(): Promise<void> {
   // Listen for incoming messages
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages[0];
-    if (!msg.key.fromMe && m.type === "notify") {
+
+    // Extract actual message content. If it's not a standard text message, this will be null.
+    const messageContent =
+      msg.message?.conversation || msg.message?.extendedTextMessage?.text;
+
+    // Create a more stable unique key using sender JID and timestamp
+    const uniqueKey = `${msg.key.remoteJid}_${msg.messageTimestamp}`;
+
+    // Process only if there is actual text content and the message is new and not processed yet
+    if (
+      messageContent &&
+      uniqueKey &&
+      !processedMessages.has(uniqueKey) &&
+      !msg.key.fromMe &&
+      m.type === "notify" &&
+      connectionTimestamp &&
+      msg.messageTimestamp &&
+      (msg.messageTimestamp as number) > connectionTimestamp
+    ) {
+      // Add unique key to processed set immediately to prevent reprocessing
+      processedMessages.add(uniqueKey);
+
       // Log the entire message object for debugging
       console.log("Received new message:", JSON.stringify(msg, undefined, 2));
 
       // The sender's number is in msg.key.remoteJid
-      // const senderNumber = msg.key.remoteJid;
       const senderNumber = msg.key.remoteJid?.split("@")[0] || "unknown";
-
       console.log("Sender Number:", senderNumber);
-
-      // The message content depends on the message type.
-      // For a simple text message, it's in msg.message.conversation.
-      const messageContent =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        "No text content";
       console.log("Message Content:", messageContent);
 
       try {
-        await axios.post(`${API_URL_ChatatID}/api/messages`, {
+        const res = await axios.post(`${API_URL_ChatatID}/api/messages`, {
           number: senderNumber,
-          message: messageContent,
+          chatRaw: messageContent,
         });
         console.log("Message sent to Next.js API");
+
+        // Send a reply message
+        await sock.sendMessage(msg.key.remoteJid!, { text: res.data.message });
+        console.log("Reply message sent.");
       } catch (error) {
         console.error("Error sending message to Next.js API:", error);
       }
